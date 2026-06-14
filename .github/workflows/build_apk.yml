@@ -40,6 +40,12 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+      - name: Download MediaPipe Model
+        run: |
+          mkdir -p android/app/src/main/assets
+          curl -L -o android/app/src/main/assets/face_landmarker.task "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+          mkdir -p assets
+          curl -L -o assets/face_landmarker.task "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
       - name: Set up Flutter 3.32.2
         uses: subosito/flutter-action@v2
         with:
