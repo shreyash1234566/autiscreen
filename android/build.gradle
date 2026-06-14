@@ -1,0 +1,19 @@
+// Root build.gradle — configuration lives in settings.gradle (Flutter 3.22+ style)
+// AGP, Kotlin plugin versions are declared there; no buildscript block needed here.
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects { project.evaluationDependsOn(":app") }
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

@@ -1,0 +1,49 @@
+name: autism_screening
+description: India-focused autism screening tool - Jomga Health
+
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # Text-to-speech — pre-warms for child name call (Task B) and imitation prompts (Task C)
+  # 4.0.2: Android 16 / API 36 compatible; updated TTS engine API
+  flutter_tts: ^4.0.2
+
+  # HTTP — session upload to Jomga Health backend
+  dio: ^5.7.0
+
+  # Local key-value storage — child profile persistence
+  shared_preferences: ^2.2.3
+
+  # Runtime permissions — CAMERA, RECORD_AUDIO for Tasks A/B/C
+  # 11.3.1: handles Android 16 permission model changes correctly
+  permission_handler: ^11.3.1
+
+  # UUID — session and child IDs
+  uuid: ^4.4.0
+
+  # Path utilities — local encrypted session file path
+  path_provider: ^2.1.4
+  path: ^1.9.0
+
+  # JSON serialisation — session data / child profile
+  json_annotation: ^4.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  build_runner: ^2.4.12
+  json_serializable: ^6.8.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/face_landmarker.task

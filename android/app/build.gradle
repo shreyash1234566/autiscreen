@@ -1,0 +1,71 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace "com.autism.screening"
+    compileSdk 36   // Android 16 (API 36)
+
+    defaultConfig {
+        applicationId "com.autism.screening.autiscreen"
+        minSdk 24           // Android 7.0+ — required by flutter_tts
+        targetSdk 36        // Android 16
+        versionCode 1
+        versionName "1.0.0"
+        ndk { abiFilters "arm64-v8a", "armeabi-v7a", "x86_64" }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        // Core library desugaring — unlocks Java 8+ APIs (java.time etc.) on minSdk 21
+        coreLibraryDesugaringEnabled true
+    }
+
+    kotlinOptions { jvmTarget = "17" }
+
+    // ── Android 16: 16 KB page-size alignment ───────────────────────────────
+    // Google Play requires all native .so files to be 16 KB page-aligned for
+    // apps targeting Android 15+ (enforced from Nov 1, 2025).
+    // useLegacyPackaging=false tells AGP NOT to compress JNI libs, so the
+    // OS can mmap them directly without repacking at install time.
+    // See: https://developer.android.com/guide/practices/page-sizes
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+}
+
+flutter { source "../.." }
+
+dependencies {
+    // Java 8+ API desugaring for devices running API < 26
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
+
+    // MediaPipe Face Landmarker — 478-point mesh with iris tracking
+    // 0.10.26 = first release where ALL Android AAR packages are 16 KB page-aligned
+    // Ref: github.com/google-ai-edge/mediapipe/releases — "All the latest Android
+    //       packages from Google Maven are now supporting the Android 16kb page size"
+    implementation "com.google.mediapipe:tasks-vision:0.10.26"
+
+    // CameraX 1.4.0 — stable, Android 16 compatible
+    // Supports predictive back and the new WindowInsets edge-to-edge contract
+    implementation "androidx.camera:camera-core:1.4.0"
+    implementation "androidx.camera:camera-camera2:1.4.0"
+    implementation "androidx.camera:camera-lifecycle:1.4.0"
+
+    // Activity + Window for edge-to-edge / back-gesture APIs
+    implementation "androidx.activity:activity-ktx:1.9.0"
+    implementation "androidx.core:core-ktx:1.13.1"
+}
