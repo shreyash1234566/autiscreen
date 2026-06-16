@@ -16,6 +16,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
+import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
@@ -169,7 +170,7 @@ class MediaPipeHandler(private val context: Context) {
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(
                     Quality.SD,                              // 480p — good balance size/quality
-                    QualitySelector.fallbackStrategy(Quality.LOWEST)
+                    FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
                 ))
                 .build()
             val vc = VideoCapture.withOutput(recorder)
