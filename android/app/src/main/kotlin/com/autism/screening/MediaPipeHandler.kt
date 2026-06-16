@@ -65,7 +65,7 @@ class MediaPipeHandler(private val context: Context) {
 
     private var faceLandmarker: FaceLandmarker? = null
     private var cameraProvider: ProcessCameraProvider? = null
-    private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private var cameraExecutor = Executors.newSingleThreadExecutor()
     private var sink: EventChannel.EventSink? = null
     private var isRunning = false
 
@@ -80,6 +80,11 @@ class MediaPipeHandler(private val context: Context) {
     fun start() {
         if (isRunning) return
         isRunning = true
+
+        if (cameraExecutor.isShutdown) {
+            cameraExecutor = Executors.newSingleThreadExecutor()
+        }
+
         buildLandmarker()
         startCamera()
         Log.d(TAG, "MediaPipeHandler started")
@@ -112,17 +117,11 @@ class MediaPipeHandler(private val context: Context) {
         val rec = activeRecording
         if (rec != null) {
             stopCallback = { videoPath ->
-                cameraProvider?.unbindAll()
-                cameraProvider = null
-                if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
                 Log.d(TAG, "MediaPipeHandler stopped — video: $videoPath")
                 callback(videoPath)
             }
             rec.stop()   // VideoRecordEvent.Finalize fires on mainExecutor
         } else {
-            cameraProvider?.unbindAll()
-            cameraProvider = null
-            if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
             Log.d(TAG, "MediaPipeHandler stopped — no active recording")
             callback(null)
         }
