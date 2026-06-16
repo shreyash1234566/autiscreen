@@ -18,6 +18,10 @@ class MediaPipeService {
   bool _isRunning = false;
   final List<GazeDataPoint> _buffer = [];
 
+  /// Absolute path of the MP4 recorded during the most recent tracking session.
+  /// Populated by stopTracking(). Null if recording failed or hasn't run yet.
+  String? lastVideoPath;
+
   Future<void> startTracking() async {
     if (_isRunning) return;
     _isRunning = true;
@@ -36,12 +40,18 @@ class MediaPipeService {
     await _channel.invokeMethod('startTracking');
   }
 
-  Future<void> stopTracking() async {
-    if (!_isRunning) return;
+  /// Stops tracking and waits for video recording to finalize.
+  /// Returns the absolute path of the saved MP4, or null on error.
+  /// Also stores the path in [lastVideoPath] for retrieval by the caller.
+  Future<String?> stopTracking() async {
+    if (!_isRunning) return lastVideoPath;
     _isRunning = false;
-    await _channel.invokeMethod('stopTracking');
+    // invokeMethod now returns String? — the video file path from Kotlin
+    final path = await _channel.invokeMethod<String?>('stopTracking');
+    lastVideoPath = path;
     await _nativeSub?.cancel();
     _gazeController?.close();
+    return path;
   }
 
   List<GazeDataPoint> consumeBuffer() {

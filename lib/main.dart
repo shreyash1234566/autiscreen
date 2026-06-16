@@ -79,6 +79,7 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
   List<NameTrialResult> _nameTrials = [];
   List<GazeDataPoint> _gazeTaskC = [];
   List<BubbleTouchEvent> _bubbleEvents = [];
+  String? _videoPath; // absolute path to MP4 from MediaPipe VideoCapture
 
   final _mediaPipe = MediaPipeService();
   final _tts = TtsService();
@@ -113,7 +114,12 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
   }
 
   void _onTaskCComplete(List<GazeDataPoint> gaze) {
-    setState(() { _gazeTaskC = gaze; _step = _SessionStep.taskD; });
+    // Task C is the last MediaPipe task — capture video path before Task D starts
+    setState(() {
+      _gazeTaskC = gaze;
+      _videoPath = _mediaPipe.lastVideoPath;
+      _step = _SessionStep.taskD;
+    });
   }
 
   void _onTaskDComplete(List<BubbleTouchEvent> events) {
@@ -125,7 +131,7 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
       sessionId: const Uuid().v4(),
       childId: _child!.id,
       startedAt: DateTime.now(),
-      videoPath: '', // video recorded natively and path passed separately
+      videoPath: _videoPath ?? '',
       gazeTaskA: _gazeTaskA,
       gazeTaskB: _gazeTaskB,
       nameTrials: _nameTrials,
@@ -141,7 +147,7 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
     // Register child server-side if not done
     await _api.registerChild(_child!.toJson());
     // Upload session (video path empty for now — extend as needed)
-    await _api.uploadSession(session: session, videoPath: '');
+    await _api.uploadSession(session: session, videoPath: _videoPath);
   }
 
   @override
