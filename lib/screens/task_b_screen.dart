@@ -145,7 +145,7 @@ class _TaskBScreenState extends State<TaskBScreen> {
     });
   }
 
-  void _finish() {
+  void _finish() async {
     _gazeSub?.cancel();
     await widget.mediaPipeService.stopTracking();
     final gazeData = widget.mediaPipeService.consumeBuffer();
