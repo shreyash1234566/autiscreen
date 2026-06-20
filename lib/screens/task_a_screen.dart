@@ -13,7 +13,7 @@ import '../services/mediapipe_service.dart';
 /// MediaPipe records gaze throughout.
 class TaskAScreen extends StatefulWidget {
   final MediaPipeService mediaPipeService;
-  final void Function(List<GazeDataPoint> gaze) onComplete;
+  final void Function(List<GazeDataPoint> gaze, String? videoPath) onComplete;
 
   const TaskAScreen({
     super.key,
@@ -69,8 +69,12 @@ class _TaskAScreenState extends State<TaskAScreen>
     }
   }
 
-  void _startTask() {
-    widget.mediaPipeService.startTracking();
+  void _startTask() async {
+    // FIX: await startTracking() — this now genuinely waits for native
+    // VideoRecordEvent.Start before the countdown begins, so the task's
+    // on-screen timer and the actual recording start in lockstep.
+    await widget.mediaPipeService.startTracking();
+    if (!mounted) return;
 
     _countdownTimer =
         Timer.periodic(const Duration(seconds: 1), (t) {
@@ -84,9 +88,12 @@ class _TaskAScreenState extends State<TaskAScreen>
   }
 
   void _finish() async {
-    await widget.mediaPipeService.stopTracking();
+    // FIX: capture the returned path instead of discarding it — this is
+    // Task A's OWN clip and must reach main.dart, not be overwritten by
+    // Task B's/Task C's clip later.
+    final videoPath = await widget.mediaPipeService.stopTracking();
     final gaze = widget.mediaPipeService.consumeBuffer();
-    if (mounted) widget.onComplete(gaze);
+    if (mounted) widget.onComplete(gaze, videoPath);
   }
 
   @override

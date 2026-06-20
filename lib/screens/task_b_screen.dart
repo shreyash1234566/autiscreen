@@ -14,7 +14,7 @@ class TaskBScreen extends StatefulWidget {
   final String languageCode;
   final MediaPipeService mediaPipeService;
   final TtsService ttsService;
-  final void Function(List<NameTrialResult> trials, List<GazeDataPoint> gazeData) onComplete;
+  final void Function(List<NameTrialResult> trials, List<GazeDataPoint> gazeData, String? videoPath) onComplete;
 
   const TaskBScreen({
     super.key,
@@ -49,7 +49,16 @@ class _TaskBScreenState extends State<TaskBScreen> {
   @override
   void initState() {
     super.initState();
-    widget.mediaPipeService.startTracking();
+    _init();
+  }
+
+  // FIX: initState() can't be async, so the await happens here instead.
+  // The gaze stream subscription and the first inter-trial gap now only
+  // start once native recording has actually begun (VideoRecordEvent.Start),
+  // instead of racing ahead of an unconfirmed startTracking() call.
+  Future<void> _init() async {
+    await widget.mediaPipeService.startTracking();
+    if (!mounted) return;
     _gazeSub = widget.mediaPipeService.gazeStream?.listen((p) {
       _gazeBuffer.add(p);
     });
@@ -147,9 +156,10 @@ class _TaskBScreenState extends State<TaskBScreen> {
 
   void _finish() async {
     _gazeSub?.cancel();
-    await widget.mediaPipeService.stopTracking();
+    // FIX: capture Task B's own clip path instead of discarding it.
+    final videoPath = await widget.mediaPipeService.stopTracking();
     final gazeData = widget.mediaPipeService.consumeBuffer();
-    widget.onComplete(_trialResults, gazeData);
+    widget.onComplete(_trialResults, gazeData, videoPath);
   }
 
   @override

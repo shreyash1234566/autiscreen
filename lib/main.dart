@@ -80,10 +80,13 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
   List<GazeDataPoint> _gazeTaskC = [];
   List<BubbleTouchEvent> _bubbleEvents = [];
 
-  /// Absolute path to the single continuous MP4 covering Tasks A + B + C.
-  /// Set by _onTaskCComplete() via MediaPipeService.finalizeVideo().
-  /// Null if recording failed.
-  String? _videoPath;
+  // FIX: was a single `_videoPath`, set once from `_mediaPipe.lastVideoPath`
+  // after Task C — which silently discarded Task A's and B's recordings and
+  // only ever forwarded Task C's clip (the shortest task) to the backend.
+  // Each task's own clip is now captured at the point it actually completes.
+  String? _videoTaskAPath;
+  String? _videoTaskBPath;
+  String? _videoTaskCPath;
 
   final _mediaPipe = MediaPipeService();
   final _tts = TtsService();
@@ -109,31 +112,30 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
     setState(() { _questionnaireResult = result; _step = _SessionStep.taskA; });
   }
 
-  void _onTaskAComplete(List<GazeDataPoint> gaze) {
-    setState(() { _gazeTaskA = gaze; _step = _SessionStep.taskB; });
+  void _onTaskAComplete(List<GazeDataPoint> gaze, String? videoPath) {
+    setState(() {
+      _gazeTaskA = gaze;
+      _videoTaskAPath = videoPath;
+      _step = _SessionStep.taskB;
+    });
   }
 
-  void _onTaskBComplete(List<NameTrialResult> trials, List<GazeDataPoint> gaze) {
-    setState(() { _nameTrials = trials; _gazeTaskB = gaze; _step = _SessionStep.taskC; });
+  void _onTaskBComplete(
+      List<NameTrialResult> trials, List<GazeDataPoint> gaze, String? videoPath) {
+    setState(() {
+      _nameTrials = trials;
+      _gazeTaskB = gaze;
+      _videoTaskBPath = videoPath;
+      _step = _SessionStep.taskC;
+    });
   }
 
-  /// Called after Task C's stopTracking() has returned.
-  ///
-  /// FIX: instead of reading mediaPipe.lastVideoPath (which was only Task C's
-  /// tiny recording), we now call finalizeVideo() to stop the single continuous
-  /// recording that has been running since Task A started.  The resulting MP4
-  /// covers Tasks A + B + C (~3–4 minutes) and is several MB in size.
-  void _onTaskCComplete(List<GazeDataPoint> gaze) async {
-    // Store Task C gaze immediately so it's available even if finalizeVideo fails
-    setState(() { _gazeTaskC = gaze; });
-
-    // Finalise the session-wide recording (A + B + C).
-    // This awaits VideoRecordEvent.Finalize — typically < 500 ms.
-    _videoPath = await _mediaPipe.finalizeVideo();
-
-    if (mounted) {
-      setState(() { _step = _SessionStep.taskD; });
-    }
+  void _onTaskCComplete(List<GazeDataPoint> gaze, String? videoPath) {
+    setState(() {
+      _gazeTaskC = gaze;
+      _videoTaskCPath = videoPath;
+      _step = _SessionStep.taskD;
+    });
   }
 
   void _onTaskDComplete(List<BubbleTouchEvent> events) {
@@ -145,7 +147,9 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
       sessionId: const Uuid().v4(),
       childId: _child!.id,
       startedAt: DateTime.now(),
-      videoPath: _videoPath ?? '',
+      videoTaskAPath: _videoTaskAPath,
+      videoTaskBPath: _videoTaskBPath,
+      videoTaskCPath: _videoTaskCPath,
       gazeTaskA: _gazeTaskA,
       gazeTaskB: _gazeTaskB,
       nameTrials: _nameTrials,
@@ -160,8 +164,13 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
 
     // Register child server-side if not done
     await _api.registerChild(_child!.toJson());
-    // Upload session with the full A+B+C video
-    await _api.uploadSession(session: session, videoPath: _videoPath);
+    // Upload session with all three per-task clips
+    await _api.uploadSession(
+      session: session,
+      videoTaskAPath: _videoTaskAPath,
+      videoTaskBPath: _videoTaskBPath,
+      videoTaskCPath: _videoTaskCPath,
+    );
   }
 
   @override

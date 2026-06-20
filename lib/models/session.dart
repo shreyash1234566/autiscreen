@@ -75,7 +75,15 @@ class SessionData {
   final String sessionId;
   final String childId;
   final DateTime startedAt;
-  final String videoPath; // local encrypted path pre-upload
+
+  // FIX: was a single `videoPath` field, overwritten by whichever task
+  // finished last (always Task C in practice) and read only once in
+  // main.dart — Task A's and B's recordings were silently discarded.
+  // Now each task's own clip is carried through separately.
+  final String? videoTaskAPath;
+  final String? videoTaskBPath;
+  final String? videoTaskCPath;
+
   final List<GazeDataPoint> gazeTaskA; // social preference gaze
   final List<GazeDataPoint> gazeTaskB; // name response gaze
   final List<NameTrialResult> nameTrials;
@@ -89,7 +97,9 @@ class SessionData {
     required this.sessionId,
     required this.childId,
     required this.startedAt,
-    required this.videoPath,
+    this.videoTaskAPath,
+    this.videoTaskBPath,
+    this.videoTaskCPath,
     required this.gazeTaskA,
     required this.gazeTaskB,
     required this.nameTrials,

@@ -13,7 +13,7 @@ class TaskCScreen extends StatefulWidget {
   final String languageCode;
   final MediaPipeService mediaPipeService;
   final TtsService ttsService;
-  final void Function(List<GazeDataPoint> gaze) onComplete;
+  final void Function(List<GazeDataPoint> gaze, String? videoPath) onComplete;
 
   const TaskCScreen({
     super.key,
@@ -59,7 +59,14 @@ class _TaskCScreenState extends State<TaskCScreen>
   @override
   void initState() {
     super.initState();
-    widget.mediaPipeService.startTracking();
+    _init();
+  }
+
+  // FIX: await startTracking() before kicking off the action sequence, so
+  // recording is confirmed rolling before the first TTS/demo phase begins.
+  Future<void> _init() async {
+    await widget.mediaPipeService.startTracking();
+    if (!mounted) return;
     _runAction();
   }
 
@@ -113,9 +120,13 @@ class _TaskCScreenState extends State<TaskCScreen>
   }
 
   void _finish() async {
-    await widget.mediaPipeService.stopTracking();
+    // Task C is the LAST camera-using task — release the camera after this
+    // clip is finalised so it isn't held open through Task D (which never
+    // touches the camera).
+    final videoPath =
+        await widget.mediaPipeService.stopTracking(releaseCamera: true);
     final gaze = widget.mediaPipeService.consumeBuffer();
-    if (mounted) widget.onComplete(gaze);
+    if (mounted) widget.onComplete(gaze, videoPath);
   }
 
   @override

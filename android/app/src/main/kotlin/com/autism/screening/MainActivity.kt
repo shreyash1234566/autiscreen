@@ -22,28 +22,33 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    // FIX: result.success() now fires only once
+                    // VideoRecordEvent.Start has actually been received for
+                    // this task's Recording — not the instant start() is
+                    // invoked. This closes the async race that previously let
+                    // a task's countdown timer run its full duration before
+                    // the camera/recorder had genuinely started.
                     "startTracking" -> {
                         try {
-                            mediaHandler.start()
-                            result.success(null)
+                            mediaHandler.start { started ->
+                                if (started) {
+                                    result.success(null)
+                                } else {
+                                    result.error("START_FAILED",
+                                        "Camera or recorder failed to start", null)
+                                }
+                            }
                         } catch (e: Exception) {
                             result.error("START_ERROR", e.message, null)
                         }
                     }
 
-                    // stopTracking now stops GAZE ANALYSIS ONLY — video keeps rolling.
-                    // Returns null immediately (no path yet; use finalizeVideo after Task C).
+                    // releaseCamera=true is passed only after the LAST
+                    // camera-using task (Task C) so the camera is unbound
+                    // exactly once, after all three clips are captured.
                     "stopTracking" -> {
-                        mediaHandler.stop { _ ->
-                            result.success(null)
-                        }
-                    }
-
-                    // finalizeVideo — called once after Task C.
-                    // Stops and finalises the continuous A+B+C recording, then returns
-                    // the absolute MP4 path (or null on error).
-                    "finalizeVideo" -> {
-                        mediaHandler.finalizeVideo { videoPath ->
+                        val releaseCamera = call.argument<Boolean>("releaseCamera") ?: false
+                        mediaHandler.stop(releaseCamera) { videoPath ->
                             result.success(videoPath)
                         }
                     }
@@ -65,7 +70,8 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Ensure video is properly finalised if the app is killed mid-session.
-        if (::mediaHandler.isInitialized) mediaHandler.finalizeVideo { /* fire-and-forget */ }
+        // Always release the camera on app teardown, even if Task C never
+        // finished cleanly (e.g. app killed mid-session).
+        if (::mediaHandler.isInitialized) mediaHandler.stop(true) {}
     }
 }

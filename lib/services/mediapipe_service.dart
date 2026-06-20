@@ -6,19 +6,23 @@ import '../models/session.dart';
 /// Communicates with the native Android MediaPipe Face Landmarker.
 /// Native code lives in MediaPipeHandler.kt
 ///
-/// FIX — video pipeline:
-///   Previously, startTracking()/stopTracking() were called once per task,
-///   triggering three full camera bind/record/unbind cycles in Kotlin.
-///   The camera provider listener fires asynchronously, so by Task C the
-///   cumulative hardware re-init latency produced only ~70 KB of video.
+/// Each task (A, B, C) calls startTracking()/stopTracking() independently
+/// and gets back its OWN video clip — three tasks, three files. Task D never
+/// calls this service at all (it's pure touch input, no camera).
 ///
-///   Now:
-///     • startTracking()  — on the first call, starts the camera + recording.
-///                          Subsequent calls (Tasks B, C) only restart the
-///                          face landmarker; the camera keeps rolling.
-///     • stopTracking()   — stops gaze analysis only; video keeps recording.
-///     • finalizeVideo()  — called once after Task C; stops and finalises the
-///                          recording and returns the absolute MP4 path.
+/// ── BUG FIX ──────────────────────────────────────────────────────────────
+/// Previously, `startTracking()` resolved as soon as the platform channel
+/// call returned — which on the native side happened the instant `start()`
+/// was invoked, before the camera had actually bound or the recorder had
+/// begun producing frames. Combined with every call site (`task_a/b/c
+/// _screen.dart`) firing `startTracking()` WITHOUT awaiting it at all, the
+/// task's on-screen timer/TTS sequence could run its entire duration before
+/// recording had genuinely started.
+///
+/// Native `start()` now only resolves once `VideoRecordEvent.Start` has
+/// actually fired, so `await startTracking()` here is a real guarantee that
+/// frames are being encoded — not just that the method was called.
+/// ───────────────────────────────────────────────────────────────────────
 class MediaPipeService {
   static const MethodChannel _channel =
       MethodChannel('autism_screening/mediapipe');
@@ -32,8 +36,10 @@ class MediaPipeService {
   bool _isRunning = false;
   final List<GazeDataPoint> _buffer = [];
 
-  /// Absolute path of the MP4 recorded for the full session (Tasks A+B+C).
-  /// Populated by finalizeVideo(). Null until finalizeVideo() is called.
+  /// Absolute path of the MP4 recorded during the most recent tracking
+  /// session. Populated by stopTracking(). Kept for convenience/back-compat;
+  /// callers should prefer the return value of [stopTracking] directly so
+  /// each task's path is captured rather than overwritten by the next task.
   String? lastVideoPath;
 
   Future<void> startTracking() async {
@@ -51,37 +57,26 @@ class MediaPipeService {
       _gazeController?.add(point);
     });
 
-    // First call: Kotlin starts the camera + recording.
-    // Subsequent calls (Tasks B, C): Kotlin only rebuilds the face landmarker;
-    // the camera and VideoCapture use case keep running uninterrupted.
+    // This now genuinely waits for native VideoRecordEvent.Start, not just
+    // for the method call to be dispatched.
     await _channel.invokeMethod('startTracking');
   }
 
-  /// Stops gaze analysis (face landmarker) only.
+  /// Stops tracking and waits for THIS task's video recording to finalize.
+  /// Returns the absolute path of the saved MP4 (or null on error).
   ///
-  /// The video recording is intentionally left running so there are no
-  /// bind/unbind cycles between tasks.  Call [finalizeVideo] once after
-  /// Task C to stop the recording and obtain the file path.
-  Future<void> stopTracking() async {
-    if (!_isRunning) return;
+  /// Pass [releaseCamera] = true on the LAST camera-using task (Task C) so
+  /// the native side unbinds the camera after that clip is finalised.
+  Future<String?> stopTracking({bool releaseCamera = false}) async {
+    if (!_isRunning) return lastVideoPath;
     _isRunning = false;
-
-    // Kotlin stop() stops the face landmarker, returns null immediately.
-    // The VideoCapture use case keeps recording.
-    await _channel.invokeMethod<void>('stopTracking');
-
+    final path = await _channel.invokeMethod<String?>(
+      'stopTracking',
+      {'releaseCamera': releaseCamera},
+    );
+    lastVideoPath = path;
     await _nativeSub?.cancel();
     _gazeController?.close();
-  }
-
-  /// Finalises the continuous session recording (covers Tasks A + B + C).
-  ///
-  /// Call this ONCE after Task C's stopTracking() has returned.
-  /// Waits for VideoRecordEvent.Finalize, then returns the absolute MP4 path.
-  /// The returned path is also stored in [lastVideoPath].
-  Future<String?> finalizeVideo() async {
-    final path = await _channel.invokeMethod<String?>('finalizeVideo');
-    lastVideoPath = path;
     return path;
   }
 
@@ -100,8 +95,12 @@ class MediaPipeService {
   // ─────────────────────────────────────────────────────────────────────────
   // Parse raw map from native MediaPipe Face Landmarker.
   //
-  // Uses gaze_h and gaze_v sent directly from Kotlin, which are computed
-  // as the eye-width-normalised iris-to-eye-corner ratio.
+  // Fix: was recomputing gazeH as raw average of left_iris_x + right_iris_x,
+  // which ignores eye-width variation and gives a different scale than the
+  // threshold values calibrated from Perochon et al. 2023.
+  //
+  // Now uses gaze_h and gaze_v sent directly from Kotlin, which are computed
+  // as the eye-width-normalised iris-to-eye-corner ratio — the correct quantity.
   //
   // Coordinate convention (after Kotlin-side front-camera horizontal flip):
   //   gaze_h < 0.5  →  looking at LEFT half of screen  (social content, Task A)
@@ -154,6 +153,7 @@ class MediaPipeService {
         p.timestampMs >= nameCalledAtMs - 2000 &&
         p.timestampMs < nameCalledAtMs).toList();
 
+    // If no baseline, use the first point in window as baseline
     final baselineYaw = baselinePoints.isNotEmpty
         ? baselinePoints.map((p) => p.headYawDegrees).reduce((a, b) => a + b) / baselinePoints.length
         : windowPoints.first.headYawDegrees;

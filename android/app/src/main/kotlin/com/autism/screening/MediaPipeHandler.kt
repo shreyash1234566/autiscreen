@@ -37,23 +37,39 @@ import kotlin.math.*
  * MediaPipeHandler — wraps MediaPipe Face Landmarker (478-point mesh + irises)
  * and owns a CameraX ImageAnalysis + VideoCapture pipeline.
  *
- * FIX (was: tiny ~70 KB upload):
- *   Previously, start()/stop() were called once per task (A, B, C), triggering
- *   three full camera bind → record → unbind → rebind cycles.  The camera provider
- *   listener fires asynchronously, so by Task C the cumulative hardware re-init
- *   latency meant only 1–2 frames were captured before stop() fired — ~70 KB.
+ * Each Flutter task (A, B, C) calls start()/stop() independently and gets its
+ * OWN separate MP4 file back — three tasks, three clips. Task D never touches
+ * this class.
  *
- *   Now:
- *     • start()          — starts the camera + recording on the FIRST call only.
- *                          Subsequent calls (Tasks B, C) only rebuild the face
- *                          landmarker; the camera and VideoCapture keep rolling.
- *     • stop()           — stops gaze analysis (face landmarker) only; the video
- *                          recording is intentionally left running.
- *     • finalizeVideo()  — called ONCE after Task C; stops and finalises the
- *                          recording, returns the absolute MP4 path.
+ * ─────────────────────────────────────────────────────────────────────────
+ * BUG FIXED HERE (was: ~70 KB / unusable clips):
  *
- *   Result: a single continuous MP4 covering Tasks A + B + C (~3–4 min),
- *   uploaded in full to the backend.
+ *   Previously, start() called startCamera() on EVERY task, which did:
+ *     unbindAll() → bindToLifecycle(fresh ImageAnalysis, fresh VideoCapture)
+ *   on every single call — a full camera teardown + hardware re-init on the
+ *   2nd and 3rd cycles (Task B, Task C). Camera session teardown/rebind on
+ *   real Android hardware is slow and not guaranteed to settle quickly; the
+ *   Recorder's first frames after a rebind are frequently dropped or delayed.
+ *   Combined with `result.success(null)` being returned to Flutter the
+ *   INSTANT start() was called — before the async camera-provider listener
+ *   had even fired, let alone before VideoRecordEvent.Start confirmed the
+ *   encoder was actually producing frames — Flutter's task timer/TTS sequence
+ *   would run its full duration while native recording was still mid-rebind,
+ *   stop() would fire, and the resulting file was just container overhead
+ *   plus at most a couple of frames: ~70 KB, "extremely short and unusable."
+ *
+ *   FIX:
+ *     • The camera (ImageAnalysis + VideoCapture) is bound EXACTLY ONCE, on
+ *       the first start() call. Tasks B and C reuse the already-bound
+ *       VideoCapture/Recorder — no unbindAll(), no rebind, no teardown.
+ *     • start() does not resolve until VideoRecordEvent.Start has actually
+ *       fired for that task's Recording — Flutter's "startTracking" only
+ *       returns once recording is verifiably rolling.
+ *     • stop() starts a fresh Recording boundary by calling .stop() on the
+ *       CURRENT task's Recording and waits for VideoRecordEvent.Finalize —
+ *       returning a path that belongs to THAT task only.
+ *     • The camera is only unbound once, after Task C, via releaseCamera().
+ * ─────────────────────────────────────────────────────────────────────────
  */
 class MediaPipeHandler(private val context: Context) {
 
@@ -85,26 +101,25 @@ class MediaPipeHandler(private val context: Context) {
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
     private var videoOutputFile: File? = null
-    private var stopCallback: ((String?) -> Unit)? = null
 
-    /**
-     * True once the camera has been bound for this session.
-     * Prevents repeated bind/unbind/rebind cycles between tasks.
-     */
-    private var cameraStarted = false
+    /** True once the camera + VideoCapture use cases have been bound for this session. */
+    private var cameraBound = false
+
+    /** Fired once, from the camera-bind listener OR immediately if already bound. */
+    private var pendingStartCallback: ((Boolean) -> Unit)? = null
+
+    /** Fired from VideoRecordEvent.Finalize for the CURRENT task's Recording only. */
+    private var pendingStopCallback: ((String?) -> Unit)? = null
 
     fun setSink(s: EventChannel.EventSink?) { sink = s }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // start() — called by each task screen via startTracking().
-    //
-    // FIRST call  : builds the face landmarker AND starts the camera + recording.
-    // SECOND/THIRD: rebuilds the face landmarker only.  The camera and the
-    //               VideoCapture use case remain bound and recording continues
-    //               uninterrupted — no bind/unbind cycle, no re-init latency.
+    // start(callback) — callback(true) fires only once VideoRecordEvent.Start
+    // has actually been received for THIS task's Recording (not just once the
+    // method was invoked). callback(false) on failure.
     // ─────────────────────────────────────────────────────────────────────────
-    fun start() {
-        if (isRunning) return
+    fun start(callback: (Boolean) -> Unit) {
+        if (isRunning) { callback(true); return }
         isRunning = true
 
         if (cameraExecutor.isShutdown) {
@@ -112,87 +127,61 @@ class MediaPipeHandler(private val context: Context) {
         }
 
         buildLandmarker()
+        pendingStartCallback = callback
 
-        if (!cameraStarted) {
-            // First task: start camera + recording for the entire session
-            cameraStarted = true
-            startCamera()
-            Log.d(TAG, "MediaPipeHandler started — camera initialising")
+        if (!cameraBound) {
+            // First task: bind the camera once, then start the first Recording.
+            bindCamera()
         } else {
-            // Subsequent tasks: camera already rolling, just restarted landmarker
-            Log.d(TAG, "MediaPipeHandler started — camera already running, landmarker rebuilt")
+            // Subsequent tasks: camera already bound — just start a NEW
+            // Recording on the existing VideoCapture. No rebind.
+            startNewRecording()
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // stop() — stops gaze analysis (face landmarker) only.
-    //
-    // The VideoCapture use case is intentionally left running so that the
-    // recording continues into the next task without any break or re-init.
-    // Call finalizeVideo() once after the last MediaPipe task (Task C) to
-    // stop and finalise the recording and obtain the file path.
+    // stop(releaseCamera, callback) — stops gaze analysis + THIS task's
+    // Recording, waits for VideoRecordEvent.Finalize, returns that task's own
+    // file path. If [releaseCamera] is true (call this after the LAST
+    // camera-using task, e.g. Task C), also unbinds the camera afterwards.
     // ─────────────────────────────────────────────────────────────────────────
-    fun stop(callback: (String?) -> Unit) {
-        if (!isRunning) {
-            // Not running — nothing to tear down
+    fun stop(releaseCamera: Boolean, callback: (String?) -> Unit) {
+        if (!isRunning) { callback(null); return }
+        isRunning = false
+
+        faceLandmarker?.close()
+        faceLandmarker = null
+
+        val rec = activeRecording
+        if (rec == null) {
+            Log.w(TAG, "stop() called with no active recording")
+            if (releaseCamera) releaseCameraInternal()
             callback(null)
             return
         }
 
-        isRunning = false
-        faceLandmarker?.close()
-        faceLandmarker = null
-
-        // Video intentionally keeps rolling — do NOT touch activeRecording here.
-        Log.d(TAG, "Gaze analysis stopped; video recording continues uninterrupted")
-        callback(null)
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // finalizeVideo() — called ONCE after Task C.
-    //
-    // Stops the VideoCapture recording, waits for VideoRecordEvent.Finalize,
-    // then unbinds the camera and shuts down the executor before invoking
-    // [callback] with the absolute path of the completed MP4 (or null on error).
-    // ─────────────────────────────────────────────────────────────────────────
-    fun finalizeVideo(callback: (String?) -> Unit) {
-        cameraStarted = false   // allow re-start if the service is reused
-
-        val rec = activeRecording
-        if (rec != null) {
-            Log.d(TAG, "Finalising video recording…")
-            stopCallback = { videoPath ->
-                // Tear down camera after file is written
-                cameraProvider?.unbindAll()
-                cameraProvider = null
-                if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
-                Log.d(TAG, "Video finalised: $videoPath " +
-                        "(${videoOutputFile?.length()?.div(1024)} KB)")
-                callback(videoPath)
-            }
-            rec.stop()   // → VideoRecordEvent.Finalize on mainExecutor
-        } else {
-            // Recording never started (e.g. permission denied) or already stopped
-            Log.w(TAG, "finalizeVideo: no active recording — returning existing file path")
-            cameraProvider?.unbindAll()
-            cameraProvider = null
-            if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
-            callback(videoOutputFile?.absolutePath)
+        pendingStopCallback = { path ->
+            if (releaseCamera) releaseCameraInternal()
+            callback(path)
         }
+        rec.stop()   // → VideoRecordEvent.Finalize, handled in startNewRecording()
     }
 
-    // ── Camera + ImageAnalysis ─────────────────────────────────────────────
-    private fun startCamera() {
+    // ── Camera binding (runs exactly once per session) ─────────────────────
+    private fun bindCamera() {
         val lifecycleOwner = context as? LifecycleOwner ?: run {
             Log.e(TAG, "context is not a LifecycleOwner")
+            pendingStartCallback?.invoke(false)
+            pendingStartCallback = null
             return
         }
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             if (!isRunning) {
-                // stop() was called before the camera provider resolved
-                Log.w(TAG, "startCamera listener fired after stop() — aborting camera bind")
+                Log.w(TAG, "bindCamera listener fired after stop() — aborting")
+                pendingStartCallback?.invoke(false)
+                pendingStartCallback = null
                 return@addListener
             }
 
@@ -223,16 +212,19 @@ class MediaPipeHandler(private val context: Context) {
                 imageProxy.close()
             }
 
-            // ── Use case 2: VideoCapture (session video for backend) ─────
+            // ── Use case 2: VideoCapture (bound ONCE, reused for all 3 tasks) ──
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(
-                    Quality.SD,                              // 480p — good balance size/quality
+                    Quality.SD,
                     FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
                 ))
                 .build()
             val vc = VideoCapture.withOutput(recorder)
             videoCapture = vc
 
+            // unbindAll() here is safe & necessary the FIRST time only — there is
+            // nothing else bound yet. This is never called again after this point
+            // for the lifetime of the session, so there is no rebind cycle.
             cameraProvider?.unbindAll()
             cameraProvider?.bindToLifecycle(
                 lifecycleOwner,
@@ -240,17 +232,30 @@ class MediaPipeHandler(private val context: Context) {
                 imageAnalysis,
                 vc
             )
+            cameraBound = true
 
-            // Start the single session-wide recording
-            startVideoRecording(vc)
+            startNewRecording()
 
         }, ContextCompat.getMainExecutor(context))
     }
 
-    private fun startVideoRecording(vc: VideoCapture<Recorder>) {
-        val outputDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-            ?: context.filesDir   // fallback to internal storage if external unavailable
+    // ─────────────────────────────────────────────────────────────────────────
+    // startNewRecording() — starts a fresh Recording on the EXISTING,
+    // already-bound VideoCapture/Recorder. Called once per task (no rebind).
+    // pendingStartCallback only resolves on VideoRecordEvent.Start — i.e. the
+    // MethodChannel "startTracking" call genuinely blocks until frames are
+    // actually being encoded.
+    // ─────────────────────────────────────────────────────────────────────────
+    private fun startNewRecording() {
+        val vc = videoCapture ?: run {
+            Log.e(TAG, "startNewRecording: no VideoCapture bound")
+            pendingStartCallback?.invoke(false)
+            pendingStartCallback = null
+            return
+        }
 
+        val outputDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+            ?: context.filesDir
         val videoFile = File(outputDir, "session_${System.currentTimeMillis()}.mp4")
         videoOutputFile = videoFile
 
@@ -258,28 +263,41 @@ class MediaPipeHandler(private val context: Context) {
 
         activeRecording = vc.output
             .prepareRecording(context, outputOptions)
-            // No .withAudioEnabled() → audio OFF (ASD screening needs video, not audio)
+            // No .withAudioEnabled() → audio OFF (screening needs video, not audio)
             .start(ContextCompat.getMainExecutor(context)) { event ->
                 when (event) {
-                    is VideoRecordEvent.Start ->
-                        Log.d(TAG, "Session video recording started: ${videoFile.name}")
+                    is VideoRecordEvent.Start -> {
+                        Log.d(TAG, "Recording started: ${videoFile.name}")
+                        pendingStartCallback?.invoke(true)
+                        pendingStartCallback = null
+                    }
 
                     is VideoRecordEvent.Finalize -> {
                         activeRecording = null
                         if (!event.hasError()) {
-                            Log.d(TAG, "Session video finalised: ${videoFile.absolutePath} " +
+                            Log.d(TAG, "Recording finalised: ${videoFile.absolutePath} " +
                                     "(${videoFile.length() / 1024} KB)")
-                            stopCallback?.invoke(videoFile.absolutePath)
+                            pendingStopCallback?.invoke(videoFile.absolutePath)
                         } else {
-                            Log.e(TAG, "Video recording error ${event.error}: ${event.cause?.message}")
-                            stopCallback?.invoke(null)
+                            Log.e(TAG, "Recording error ${event.error}: ${event.cause?.message}")
+                            pendingStopCallback?.invoke(null)
                         }
-                        stopCallback = null
+                        pendingStopCallback = null
                     }
 
                     else -> { /* Status / Pause events — no action needed */ }
                 }
             }
+    }
+
+    // ── Camera teardown — called once, after the LAST camera-using task ────
+    private fun releaseCameraInternal() {
+        cameraProvider?.unbindAll()
+        cameraProvider = null
+        videoCapture = null
+        cameraBound = false
+        if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
+        Log.d(TAG, "Camera released")
     }
 
     // ── MPImage conversion ─────────────────────────────────────────────────

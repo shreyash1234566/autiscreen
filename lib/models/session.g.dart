@@ -66,7 +66,9 @@ SessionData _$SessionDataFromJson(Map<String, dynamic> json) => SessionData(
       sessionId: json['session_id'] as String,
       childId: json['child_id'] as String,
       startedAt: DateTime.parse(json['started_at'] as String),
-      videoPath: json['video_path'] as String,
+      videoTaskAPath: json['video_task_a_path'] as String?,
+      videoTaskBPath: json['video_task_b_path'] as String?,
+      videoTaskCPath: json['video_task_c_path'] as String?,
       gazeTaskA: (json['gaze_task_a'] as List<dynamic>)
           .map((e) => GazeDataPoint.fromJson(e as Map<String, dynamic>))
           .toList(),
@@ -93,7 +95,9 @@ Map<String, dynamic> _$SessionDataToJson(SessionData instance) =>
       'session_id': instance.sessionId,
       'child_id': instance.childId,
       'started_at': instance.startedAt.toIso8601String(),
-      'video_path': instance.videoPath,
+      'video_task_a_path': instance.videoTaskAPath,
+      'video_task_b_path': instance.videoTaskBPath,
+      'video_task_c_path': instance.videoTaskCPath,
       'gaze_task_a': instance.gazeTaskA,
       'gaze_task_b': instance.gazeTaskB,
       'name_trials': instance.nameTrials,
