@@ -37,11 +37,23 @@ import kotlin.math.*
  * MediaPipeHandler — wraps MediaPipe Face Landmarker (478-point mesh + irises)
  * and owns a CameraX ImageAnalysis + VideoCapture pipeline.
  *
- * Video is recorded to app-private external storage (no permission needed on API 29+;
- * getExternalFilesDir is exempt from WRITE_EXTERNAL_STORAGE since API 19).
+ * FIX (was: tiny ~70 KB upload):
+ *   Previously, start()/stop() were called once per task (A, B, C), triggering
+ *   three full camera bind → record → unbind → rebind cycles.  The camera provider
+ *   listener fires asynchronously, so by Task C the cumulative hardware re-init
+ *   latency meant only 1–2 frames were captured before stop() fired — ~70 KB.
  *
- * The recorded video path is returned from stop(callback) after recording finalizes
- * and is forwarded to Dart via the MethodChannel result.
+ *   Now:
+ *     • start()          — starts the camera + recording on the FIRST call only.
+ *                          Subsequent calls (Tasks B, C) only rebuild the face
+ *                          landmarker; the camera and VideoCapture keep rolling.
+ *     • stop()           — stops gaze analysis (face landmarker) only; the video
+ *                          recording is intentionally left running.
+ *     • finalizeVideo()  — called ONCE after Task C; stops and finalises the
+ *                          recording, returns the absolute MP4 path.
+ *
+ *   Result: a single continuous MP4 covering Tasks A + B + C (~3–4 min),
+ *   uploaded in full to the backend.
  */
 class MediaPipeHandler(private val context: Context) {
 
@@ -75,8 +87,22 @@ class MediaPipeHandler(private val context: Context) {
     private var videoOutputFile: File? = null
     private var stopCallback: ((String?) -> Unit)? = null
 
+    /**
+     * True once the camera has been bound for this session.
+     * Prevents repeated bind/unbind/rebind cycles between tasks.
+     */
+    private var cameraStarted = false
+
     fun setSink(s: EventChannel.EventSink?) { sink = s }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // start() — called by each task screen via startTracking().
+    //
+    // FIRST call  : builds the face landmarker AND starts the camera + recording.
+    // SECOND/THIRD: rebuilds the face landmarker only.  The camera and the
+    //               VideoCapture use case remain bound and recording continues
+    //               uninterrupted — no bind/unbind cycle, no re-init latency.
+    // ─────────────────────────────────────────────────────────────────────────
     fun start() {
         if (isRunning) return
         isRunning = true
@@ -86,26 +112,29 @@ class MediaPipeHandler(private val context: Context) {
         }
 
         buildLandmarker()
-        startCamera()
-        Log.d(TAG, "MediaPipeHandler started")
+
+        if (!cameraStarted) {
+            // First task: start camera + recording for the entire session
+            cameraStarted = true
+            startCamera()
+            Log.d(TAG, "MediaPipeHandler started — camera initialising")
+        } else {
+            // Subsequent tasks: camera already rolling, just restarted landmarker
+            Log.d(TAG, "MediaPipeHandler started — camera already running, landmarker rebuilt")
+        }
     }
 
-    /**
-     * Stops gaze analysis immediately, then waits for video recording to finalize
-     * before calling [callback] with the absolute path of the saved MP4 (or null on error).
-     *
-     * Sequence:
-     *  1. isRunning = false     → no more frame analysis
-     *  2. faceLandmarker.close()
-     *  3. activeRecording.stop() → async; fires VideoRecordEvent.Finalize
-     *  4. Finalize handler → unbind camera → shutdown executor → callback(path)
-     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // stop() — stops gaze analysis (face landmarker) only.
+    //
+    // The VideoCapture use case is intentionally left running so that the
+    // recording continues into the next task without any break or re-init.
+    // Call finalizeVideo() once after the last MediaPipe task (Task C) to
+    // stop and finalise the recording and obtain the file path.
+    // ─────────────────────────────────────────────────────────────────────────
     fun stop(callback: (String?) -> Unit) {
-        if (!isRunning && activeRecording == null) {
-            // Nothing was started
-            cameraProvider?.unbindAll()
-            cameraProvider = null
-            if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
+        if (!isRunning) {
+            // Not running — nothing to tear down
             callback(null)
             return
         }
@@ -114,16 +143,41 @@ class MediaPipeHandler(private val context: Context) {
         faceLandmarker?.close()
         faceLandmarker = null
 
+        // Video intentionally keeps rolling — do NOT touch activeRecording here.
+        Log.d(TAG, "Gaze analysis stopped; video recording continues uninterrupted")
+        callback(null)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // finalizeVideo() — called ONCE after Task C.
+    //
+    // Stops the VideoCapture recording, waits for VideoRecordEvent.Finalize,
+    // then unbinds the camera and shuts down the executor before invoking
+    // [callback] with the absolute path of the completed MP4 (or null on error).
+    // ─────────────────────────────────────────────────────────────────────────
+    fun finalizeVideo(callback: (String?) -> Unit) {
+        cameraStarted = false   // allow re-start if the service is reused
+
         val rec = activeRecording
         if (rec != null) {
+            Log.d(TAG, "Finalising video recording…")
             stopCallback = { videoPath ->
-                Log.d(TAG, "MediaPipeHandler stopped — video: $videoPath")
+                // Tear down camera after file is written
+                cameraProvider?.unbindAll()
+                cameraProvider = null
+                if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
+                Log.d(TAG, "Video finalised: $videoPath " +
+                        "(${videoOutputFile?.length()?.div(1024)} KB)")
                 callback(videoPath)
             }
-            rec.stop()   // VideoRecordEvent.Finalize fires on mainExecutor
+            rec.stop()   // → VideoRecordEvent.Finalize on mainExecutor
         } else {
-            Log.d(TAG, "MediaPipeHandler stopped — no active recording")
-            callback(null)
+            // Recording never started (e.g. permission denied) or already stopped
+            Log.w(TAG, "finalizeVideo: no active recording — returning existing file path")
+            cameraProvider?.unbindAll()
+            cameraProvider = null
+            if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
+            callback(videoOutputFile?.absolutePath)
         }
     }
 
@@ -136,7 +190,11 @@ class MediaPipeHandler(private val context: Context) {
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
-            if (!isRunning) return@addListener   // stop() was called before camera bound
+            if (!isRunning) {
+                // stop() was called before the camera provider resolved
+                Log.w(TAG, "startCamera listener fired after stop() — aborting camera bind")
+                return@addListener
+            }
 
             cameraProvider = cameraProviderFuture.get()
 
@@ -183,7 +241,7 @@ class MediaPipeHandler(private val context: Context) {
                 vc
             )
 
-            // Start recording immediately after binding
+            // Start the single session-wide recording
             startVideoRecording(vc)
 
         }, ContextCompat.getMainExecutor(context))
@@ -204,15 +262,16 @@ class MediaPipeHandler(private val context: Context) {
             .start(ContextCompat.getMainExecutor(context)) { event ->
                 when (event) {
                     is VideoRecordEvent.Start ->
-                        Log.d(TAG, "Video recording started: ${videoFile.name}")
+                        Log.d(TAG, "Session video recording started: ${videoFile.name}")
 
                     is VideoRecordEvent.Finalize -> {
                         activeRecording = null
                         if (!event.hasError()) {
-                            Log.d(TAG, "Video finalized: ${videoFile.absolutePath} (${videoFile.length()/1024} KB)")
+                            Log.d(TAG, "Session video finalised: ${videoFile.absolutePath} " +
+                                    "(${videoFile.length() / 1024} KB)")
                             stopCallback?.invoke(videoFile.absolutePath)
                         } else {
-                            Log.e(TAG, "Video recording error code ${event.error}: ${event.cause?.message}")
+                            Log.e(TAG, "Video recording error ${event.error}: ${event.cause?.message}")
                             stopCallback?.invoke(null)
                         }
                         stopCallback = null

@@ -30,14 +30,24 @@ class MainActivity : FlutterActivity() {
                             result.error("START_ERROR", e.message, null)
                         }
                     }
-                    // stopTracking is now ASYNC — waits for video to finalize,
-                    // then returns the MP4 absolute path (String) or null
+
+                    // stopTracking now stops GAZE ANALYSIS ONLY — video keeps rolling.
+                    // Returns null immediately (no path yet; use finalizeVideo after Task C).
                     "stopTracking" -> {
-                        mediaHandler.stop { videoPath ->
-                            // callback fires on main thread (mainExecutor in MediaPipeHandler)
-                            result.success(videoPath)   // null if no video was recorded
+                        mediaHandler.stop { _ ->
+                            result.success(null)
                         }
                     }
+
+                    // finalizeVideo — called once after Task C.
+                    // Stops and finalises the continuous A+B+C recording, then returns
+                    // the absolute MP4 path (or null on error).
+                    "finalizeVideo" -> {
+                        mediaHandler.finalizeVideo { videoPath ->
+                            result.success(videoPath)
+                        }
+                    }
+
                     else -> result.notImplemented()
                 }
             }
@@ -55,7 +65,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // stop() with empty callback — fire-and-forget on app close
-        if (::mediaHandler.isInitialized) mediaHandler.stop {}
+        // Ensure video is properly finalised if the app is killed mid-session.
+        if (::mediaHandler.isInitialized) mediaHandler.finalizeVideo { /* fire-and-forget */ }
     }
 }

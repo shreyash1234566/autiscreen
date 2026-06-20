@@ -5,6 +5,20 @@ import '../models/session.dart';
 
 /// Communicates with the native Android MediaPipe Face Landmarker.
 /// Native code lives in MediaPipeHandler.kt
+///
+/// FIX — video pipeline:
+///   Previously, startTracking()/stopTracking() were called once per task,
+///   triggering three full camera bind/record/unbind cycles in Kotlin.
+///   The camera provider listener fires asynchronously, so by Task C the
+///   cumulative hardware re-init latency produced only ~70 KB of video.
+///
+///   Now:
+///     • startTracking()  — on the first call, starts the camera + recording.
+///                          Subsequent calls (Tasks B, C) only restart the
+///                          face landmarker; the camera keeps rolling.
+///     • stopTracking()   — stops gaze analysis only; video keeps recording.
+///     • finalizeVideo()  — called once after Task C; stops and finalises the
+///                          recording and returns the absolute MP4 path.
 class MediaPipeService {
   static const MethodChannel _channel =
       MethodChannel('autism_screening/mediapipe');
@@ -18,8 +32,8 @@ class MediaPipeService {
   bool _isRunning = false;
   final List<GazeDataPoint> _buffer = [];
 
-  /// Absolute path of the MP4 recorded during the most recent tracking session.
-  /// Populated by stopTracking(). Null if recording failed or hasn't run yet.
+  /// Absolute path of the MP4 recorded for the full session (Tasks A+B+C).
+  /// Populated by finalizeVideo(). Null until finalizeVideo() is called.
   String? lastVideoPath;
 
   Future<void> startTracking() async {
@@ -37,20 +51,37 @@ class MediaPipeService {
       _gazeController?.add(point);
     });
 
+    // First call: Kotlin starts the camera + recording.
+    // Subsequent calls (Tasks B, C): Kotlin only rebuilds the face landmarker;
+    // the camera and VideoCapture use case keep running uninterrupted.
     await _channel.invokeMethod('startTracking');
   }
 
-  /// Stops tracking and waits for video recording to finalize.
-  /// Returns the absolute path of the saved MP4, or null on error.
-  /// Also stores the path in [lastVideoPath] for retrieval by the caller.
-  Future<String?> stopTracking() async {
-    if (!_isRunning) return lastVideoPath;
+  /// Stops gaze analysis (face landmarker) only.
+  ///
+  /// The video recording is intentionally left running so there are no
+  /// bind/unbind cycles between tasks.  Call [finalizeVideo] once after
+  /// Task C to stop the recording and obtain the file path.
+  Future<void> stopTracking() async {
+    if (!_isRunning) return;
     _isRunning = false;
-    // invokeMethod now returns String? — the video file path from Kotlin
-    final path = await _channel.invokeMethod<String?>('stopTracking');
-    lastVideoPath = path;
+
+    // Kotlin stop() stops the face landmarker, returns null immediately.
+    // The VideoCapture use case keeps recording.
+    await _channel.invokeMethod<void>('stopTracking');
+
     await _nativeSub?.cancel();
     _gazeController?.close();
+  }
+
+  /// Finalises the continuous session recording (covers Tasks A + B + C).
+  ///
+  /// Call this ONCE after Task C's stopTracking() has returned.
+  /// Waits for VideoRecordEvent.Finalize, then returns the absolute MP4 path.
+  /// The returned path is also stored in [lastVideoPath].
+  Future<String?> finalizeVideo() async {
+    final path = await _channel.invokeMethod<String?>('finalizeVideo');
+    lastVideoPath = path;
     return path;
   }
 
@@ -69,12 +100,8 @@ class MediaPipeService {
   // ─────────────────────────────────────────────────────────────────────────
   // Parse raw map from native MediaPipe Face Landmarker.
   //
-  // Fix: was recomputing gazeH as raw average of left_iris_x + right_iris_x,
-  // which ignores eye-width variation and gives a different scale than the
-  // threshold values calibrated from Perochon et al. 2023.
-  //
-  // Now uses gaze_h and gaze_v sent directly from Kotlin, which are computed
-  // as the eye-width-normalised iris-to-eye-corner ratio — the correct quantity.
+  // Uses gaze_h and gaze_v sent directly from Kotlin, which are computed
+  // as the eye-width-normalised iris-to-eye-corner ratio.
   //
   // Coordinate convention (after Kotlin-side front-camera horizontal flip):
   //   gaze_h < 0.5  →  looking at LEFT half of screen  (social content, Task A)
@@ -127,7 +154,6 @@ class MediaPipeService {
         p.timestampMs >= nameCalledAtMs - 2000 &&
         p.timestampMs < nameCalledAtMs).toList();
 
-    // If no baseline, use the first point in window as baseline
     final baselineYaw = baselinePoints.isNotEmpty
         ? baselinePoints.map((p) => p.headYawDegrees).reduce((a, b) => a + b) / baselinePoints.length
         : windowPoints.first.headYawDegrees;

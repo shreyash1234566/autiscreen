@@ -79,7 +79,11 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
   List<NameTrialResult> _nameTrials = [];
   List<GazeDataPoint> _gazeTaskC = [];
   List<BubbleTouchEvent> _bubbleEvents = [];
-  String? _videoPath; // absolute path to MP4 from MediaPipe VideoCapture
+
+  /// Absolute path to the single continuous MP4 covering Tasks A + B + C.
+  /// Set by _onTaskCComplete() via MediaPipeService.finalizeVideo().
+  /// Null if recording failed.
+  String? _videoPath;
 
   final _mediaPipe = MediaPipeService();
   final _tts = TtsService();
@@ -113,13 +117,23 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
     setState(() { _nameTrials = trials; _gazeTaskB = gaze; _step = _SessionStep.taskC; });
   }
 
-  void _onTaskCComplete(List<GazeDataPoint> gaze) {
-    // Task C is the last MediaPipe task — capture video path before Task D starts
-    setState(() {
-      _gazeTaskC = gaze;
-      _videoPath = _mediaPipe.lastVideoPath;
-      _step = _SessionStep.taskD;
-    });
+  /// Called after Task C's stopTracking() has returned.
+  ///
+  /// FIX: instead of reading mediaPipe.lastVideoPath (which was only Task C's
+  /// tiny recording), we now call finalizeVideo() to stop the single continuous
+  /// recording that has been running since Task A started.  The resulting MP4
+  /// covers Tasks A + B + C (~3–4 minutes) and is several MB in size.
+  void _onTaskCComplete(List<GazeDataPoint> gaze) async {
+    // Store Task C gaze immediately so it's available even if finalizeVideo fails
+    setState(() { _gazeTaskC = gaze; });
+
+    // Finalise the session-wide recording (A + B + C).
+    // This awaits VideoRecordEvent.Finalize — typically < 500 ms.
+    _videoPath = await _mediaPipe.finalizeVideo();
+
+    if (mounted) {
+      setState(() { _step = _SessionStep.taskD; });
+    }
   }
 
   void _onTaskDComplete(List<BubbleTouchEvent> events) {
@@ -146,7 +160,7 @@ class _SessionOrchestratorState extends State<SessionOrchestrator> {
 
     // Register child server-side if not done
     await _api.registerChild(_child!.toJson());
-    // Upload session (video path empty for now — extend as needed)
+    // Upload session with the full A+B+C video
     await _api.uploadSession(session: session, videoPath: _videoPath);
   }
 
