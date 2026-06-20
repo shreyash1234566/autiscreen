@@ -6,6 +6,7 @@ import android.graphics.Matrix
 import android.os.Environment
 import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -213,13 +214,41 @@ class MediaPipeHandler(private val context: Context) {
             }
 
             // ── Use case 2: VideoCapture (bound ONCE, reused for all 3 tasks) ──
+            //
+            // FIX (research-confirmed, not yet device-verified):
+            // By default, CameraX lets auto-exposure pick the camera's frame
+            // rate, and in dim indoor lighting — typical for a clinical
+            // screening room, not a bright outdoor scene — AE can legitimately
+            // negotiate the sensor down to a very low FPS to get enough light
+            // per frame. On LEGACY/LIMITED camera2 hardware levels (common on
+            // budget Android devices), this drop can be severe. That fits "8
+            // frames over 20-30s" far better than the concurrent-use-case
+            // theory from last time, which the official docs argue against
+            // (STRATEGY_KEEP_ONLY_LATEST is specifically designed to prevent
+            // a slow analyzer from starving other use cases).
+            //
+            // setTargetFrameRate() asks CameraX to hold a frame-rate floor
+            // even under AE pressure. It's a best-effort hint, not a hard
+            // requirement — verified against the current AndroidX API surface
+            // (camera-video:1.4.0, already pinned in build.gradle; the method
+            // has existed since 1.3.0-alpha06), so it won't throw if the
+            // device genuinely can't sustain it in extreme darkness.
+            //
+            // NOTE: there is a documented CameraX quirk (AeFpsRangeLegacyQuirk)
+            // where this setting was historically ignored specifically on
+            // LEGACY-level hardware in some library versions. If the next
+            // logcat run still shows a stalled Status timeline on a LEGACY-
+            // level device, the next step is bumping camera-* to 1.5.0+,
+            // not re-guessing at the app-code layer again.
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(
                     Quality.SD,
                     FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
                 ))
                 .build()
-            val vc = VideoCapture.withOutput(recorder)
+            val vc = VideoCapture.Builder(recorder)
+                .setTargetFrameRate(Range(20, 30))
+                .build()
             videoCapture = vc
 
             // unbindAll() here is safe & necessary the FIRST time only — there is
@@ -272,6 +301,26 @@ class MediaPipeHandler(private val context: Context) {
                         pendingStartCallback = null
                     }
 
+                    // DIAGNOSTIC — fires roughly once/sec during an active
+                    // recording. If durationMs climbs steadily while
+                    // bytesRecorded barely moves (or stalls for multi-second
+                    // gaps), the encoder is being starved of frames mid-
+                    // recording — not just at start/stop. Check logcat for
+                    // this tag during the next device run of Task A.
+                    is VideoRecordEvent.Status -> {
+                        val stats = event.recordingStats
+                        val durationMs = stats.recordedDurationNanos / 1_000_000
+                        Log.d(TAG, "Recording status: durationMs=$durationMs " +
+                                "bytesRecorded=${stats.numBytesRecorded}")
+                    }
+
+                    is VideoRecordEvent.Pause ->
+                        Log.w(TAG, "Recording PAUSED mid-task — likely lifecycle " +
+                                "or capture-session interruption, not a normal event")
+
+                    is VideoRecordEvent.Resume ->
+                        Log.w(TAG, "Recording RESUMED after a pause")
+
                     is VideoRecordEvent.Finalize -> {
                         activeRecording = null
                         if (!event.hasError()) {
@@ -285,7 +334,7 @@ class MediaPipeHandler(private val context: Context) {
                         pendingStopCallback = null
                     }
 
-                    else -> { /* Status / Pause events — no action needed */ }
+                    else -> { /* unhandled event type — no action needed */ }
                 }
             }
     }
