@@ -95,6 +95,16 @@ class MediaPipeHandler(private val context: Context) {
     }
 
     private var faceLandmarker: FaceLandmarker? = null
+
+    /**
+     * Tracks the last timestamp passed to detectAsync(). FaceLandmarker
+     * requires strictly increasing timestamps per call; this guards against
+     * ties from SystemClock.uptimeMillis()'s millisecond resolution. Reset
+     * on every start() since a new FaceLandmarker instance is built per task
+     * (buildLandmarker() is called fresh each time) and doesn't carry state
+     * from the previous task's timestamps.
+     */
+    private var lastDetectTimestampMs: Long = 0L
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraExecutor = Executors.newSingleThreadExecutor()
     private var sink: EventChannel.EventSink? = null
@@ -124,6 +134,7 @@ class MediaPipeHandler(private val context: Context) {
     fun start(callback: (Boolean) -> Unit) {
         if (isRunning) { callback(true); return }
         isRunning = true
+        lastDetectTimestampMs = 0L
 
         if (cameraExecutor.isShutdown) {
             cameraExecutor = Executors.newSingleThreadExecutor()
@@ -200,13 +211,55 @@ class MediaPipeHandler(private val context: Context) {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
+            // FIX (root cause of "exactly 8 frames every time, regardless of
+            // task duration" — a fixed-count cap, not a time-based one):
+            //
+            // detectAsync() is documented (FaceLandmarker Java API) to
+            // require STRICTLY monotonically increasing timestamps between
+            // calls. SystemClock.uptimeMillis() has millisecond resolution
+            // and is NOT guaranteed to differ between two consecutive
+            // analyzer invocations — especially during the camera's initial
+            // frame burst at session start, which is exactly when this kind
+            // of tie is most likely. A documented MediaPipe behavior (real
+            // GitHub issue, "Packet timestamp mismatch — mediapipe does not
+            // recover") is that once this is violated, MediaPipe keeps
+            // throwing on every subsequent call — it does not self-heal.
+            //
+            // imageProxy.close() sat AFTER the throwing call with no
+            // try/finally, so every exception leaked that frame's camera
+            // buffer permanently. With a small, fixed buffer pool, a handful
+            // of leaked buffers exhausts it — and once the pool is empty,
+            // the WHOLE capture session stalls (no more buffers for ANY
+            // bound use case, including VideoCapture), until stop() forces
+            // finalization at the end of the task. That's why frame count
+            // is a constant (~8) independent of whether the task is 24s or
+            // 104s: it's a buffer-count limit, not a time-based one.
+            //
+            // Fix: (1) guarantee close() always runs via try/finally, so a
+            // single bad frame can never leak a buffer regardless of cause;
+            // (2) guarantee the timestamp passed to detectAsync() is
+            // strictly greater than the last one used, eliminating the most
+            // likely trigger for the violation in the first place.
             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                if (isRunning) {
-                    val tsMs = SystemClock.uptimeMillis()
-                    val mpImage = imageProxyToMPImage(imageProxy)
-                    if (mpImage != null) faceLandmarker?.detectAsync(mpImage, tsMs)
+                try {
+                    if (isRunning) {
+                        val raw = SystemClock.uptimeMillis()
+                        val tsMs = if (raw > lastDetectTimestampMs) raw else lastDetectTimestampMs + 1
+                        lastDetectTimestampMs = tsMs
+                        val mpImage = imageProxyToMPImage(imageProxy)
+                        if (mpImage != null) {
+                            try {
+                                faceLandmarker?.detectAsync(mpImage, tsMs)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "detectAsync threw, frame skipped (buffer still released): ${e.message}")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Analyzer frame processing failed, buffer still released: ${e.message}")
+                } finally {
+                    imageProxy.close()
                 }
-                imageProxy.close()
             }
 
             // ── Use case 2: VideoCapture — a FRESH Recorder every task ───
