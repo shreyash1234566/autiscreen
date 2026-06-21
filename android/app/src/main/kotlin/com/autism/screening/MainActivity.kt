@@ -1,5 +1,7 @@
 package com.autism.screening
 
+import android.os.Bundle
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -12,6 +14,18 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val METHOD_CHANNEL = "autism_screening/mediapipe"
         private const val EVENT_CHANNEL  = "autism_screening/gaze_stream"
+    }
+
+    // FIX: Tasks A/B/C bind VideoCapture to THIS Activity's lifecycle. Task A
+    // in particular is a 60-second passive viewing task with zero touch
+    // input. If the device's screen times out mid-task, Android pauses the
+    // Activity, and CameraX automatically stops every use case bound to that
+    // lifecycle — including the in-progress recording — well before the
+    // intended duration. FLAG_KEEP_SCREEN_ON is the standard, zero-downside
+    // fix every camera-recording app uses for exactly this.
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {

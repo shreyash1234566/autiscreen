@@ -43,33 +43,35 @@ import kotlin.math.*
  * this class.
  *
  * ─────────────────────────────────────────────────────────────────────────
- * BUG FIXED HERE (was: ~70 KB / unusable clips):
+ * HISTORY (two bugs found in this file, in order):
  *
- *   Previously, start() called startCamera() on EVERY task, which did:
- *     unbindAll() → bindToLifecycle(fresh ImageAnalysis, fresh VideoCapture)
- *   on every single call — a full camera teardown + hardware re-init on the
- *   2nd and 3rd cycles (Task B, Task C). Camera session teardown/rebind on
- *   real Android hardware is slow and not guaranteed to settle quickly; the
- *   Recorder's first frames after a rebind are frequently dropped or delayed.
- *   Combined with `result.success(null)` being returned to Flutter the
- *   INSTANT start() was called — before the async camera-provider listener
- *   had even fired, let alone before VideoRecordEvent.Start confirmed the
- *   encoder was actually producing frames — Flutter's task timer/TTS sequence
- *   would run its full duration while native recording was still mid-rebind,
- *   stop() would fire, and the resulting file was just container overhead
- *   plus at most a couple of frames: ~70 KB, "extremely short and unusable."
+ * BUG 1 (original, ~70 KB unusable clips):
+ *   start() rebuilt the camera from scratch on every task AND told Flutter
+ *   "recording started" the instant the method was called — before the
+ *   async camera-provider listener had even fired, let alone before
+ *   VideoRecordEvent.Start confirmed the encoder was producing frames. Each
+ *   task's on-screen timer ran its full duration while native recording was
+ *   still mid-bind, so the resulting file was just container overhead.
  *
- *   FIX:
- *     • The camera (ImageAnalysis + VideoCapture) is bound EXACTLY ONCE, on
- *       the first start() call. Tasks B and C reuse the already-bound
- *       VideoCapture/Recorder — no unbindAll(), no rebind, no teardown.
- *     • start() does not resolve until VideoRecordEvent.Start has actually
- *       fired for that task's Recording — Flutter's "startTracking" only
- *       returns once recording is verifiably rolling.
- *     • stop() starts a fresh Recording boundary by calling .stop() on the
- *       CURRENT task's Recording and waits for VideoRecordEvent.Finalize —
- *       returning a path that belongs to THAT task only.
- *     • The camera is only unbound once, after Task C, via releaseCamera().
+ * BUG 2 (introduced while fixing Bug 1, Task B/C produced NO file at all):
+ *   To avoid the rebind cost, a previous version of this file bound the
+ *   camera ONCE and reused the same Recorder/VideoCapture for all three
+ *   tasks via repeated prepareRecording() calls. This is documented as
+ *   supported by the Recorder API in principle, but reusing a Recorder for
+ *   a second recording is a known source of real failures — see e.g.
+ *   "AssertionError: One-time media muxer creation has already occurred
+ *   for recording" (dotnet/android-libraries#709) for the same underlying
+ *   pattern. In practice, Task A's recording (fresh Recorder) worked; Task
+ *   B's and C's (reused Recorder) silently produced no file.
+ *
+ * CURRENT FIX:
+ *   Each task gets a genuinely NEW Recorder + VideoCapture (the standard,
+ *   universally-documented CameraX pattern: unbindAll() then bind a fresh
+ *   set of use cases) — this is what avoids Bug 2. Bug 1 is independently
+ *   fixed by NOT resolving start() until VideoRecordEvent.Start has actually
+ *   fired for that task's Recording, so Flutter's timer never gets ahead of
+ *   the real camera/encoder state regardless of how long a given rebind
+ *   takes on a given device.
  * ─────────────────────────────────────────────────────────────────────────
  */
 class MediaPipeHandler(private val context: Context) {
@@ -99,14 +101,13 @@ class MediaPipeHandler(private val context: Context) {
     private var isRunning = false
 
     // ── Video recording ────────────────────────────────────────────────────
+    // videoCapture is intentionally re-created fresh in bindCamera() on every
+    // start() call — see BUG 2 above for why it is NOT reused across tasks.
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
     private var videoOutputFile: File? = null
 
-    /** True once the camera + VideoCapture use cases have been bound for this session. */
-    private var cameraBound = false
-
-    /** Fired once, from the camera-bind listener OR immediately if already bound. */
+    /** Fired once VideoRecordEvent.Start has actually been received for THIS task. */
     private var pendingStartCallback: ((Boolean) -> Unit)? = null
 
     /** Fired from VideoRecordEvent.Finalize for the CURRENT task's Recording only. */
@@ -115,9 +116,10 @@ class MediaPipeHandler(private val context: Context) {
     fun setSink(s: EventChannel.EventSink?) { sink = s }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // start(callback) — callback(true) fires only once VideoRecordEvent.Start
-    // has actually been received for THIS task's Recording (not just once the
-    // method was invoked). callback(false) on failure.
+    // start(callback) — ALWAYS does a fresh bind (new ImageAnalysis, new
+    // Recorder, new VideoCapture) for every task. callback(true) fires only
+    // once VideoRecordEvent.Start has actually been received for THIS task's
+    // Recording. callback(false) on failure.
     // ─────────────────────────────────────────────────────────────────────────
     fun start(callback: (Boolean) -> Unit) {
         if (isRunning) { callback(true); return }
@@ -129,22 +131,16 @@ class MediaPipeHandler(private val context: Context) {
 
         buildLandmarker()
         pendingStartCallback = callback
-
-        if (!cameraBound) {
-            // First task: bind the camera once, then start the first Recording.
-            bindCamera()
-        } else {
-            // Subsequent tasks: camera already bound — just start a NEW
-            // Recording on the existing VideoCapture. No rebind.
-            startNewRecording()
-        }
+        bindCamera()
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // stop(releaseCamera, callback) — stops gaze analysis + THIS task's
     // Recording, waits for VideoRecordEvent.Finalize, returns that task's own
     // file path. If [releaseCamera] is true (call this after the LAST
-    // camera-using task, e.g. Task C), also unbinds the camera afterwards.
+    // camera-using task, e.g. Task C), also fully unbinds the camera and
+    // shuts down the analyzer executor. Otherwise the camera use cases stay
+    // bound until the NEXT task's bindCamera() unbinds+rebinds them fresh.
     // ─────────────────────────────────────────────────────────────────────────
     fun stop(releaseCamera: Boolean, callback: (String?) -> Unit) {
         if (!isRunning) { callback(null); return }
@@ -165,10 +161,10 @@ class MediaPipeHandler(private val context: Context) {
             if (releaseCamera) releaseCameraInternal()
             callback(path)
         }
-        rec.stop()   // → VideoRecordEvent.Finalize, handled in startNewRecording()
+        rec.stop()   // → VideoRecordEvent.Finalize, handled in bindCamera()'s listener
     }
 
-    // ── Camera binding (runs exactly once per session) ─────────────────────
+    // ── Camera binding — runs fresh on EVERY start() call ───────────────────
     private fun bindCamera() {
         val lifecycleOwner = context as? LifecycleOwner ?: run {
             Log.e(TAG, "context is not a LifecycleOwner")
@@ -213,33 +209,15 @@ class MediaPipeHandler(private val context: Context) {
                 imageProxy.close()
             }
 
-            // ── Use case 2: VideoCapture (bound ONCE, reused for all 3 tasks) ──
+            // ── Use case 2: VideoCapture — a FRESH Recorder every task ───
             //
-            // FIX (research-confirmed, not yet device-verified):
-            // By default, CameraX lets auto-exposure pick the camera's frame
-            // rate, and in dim indoor lighting — typical for a clinical
-            // screening room, not a bright outdoor scene — AE can legitimately
-            // negotiate the sensor down to a very low FPS to get enough light
-            // per frame. On LEGACY/LIMITED camera2 hardware levels (common on
-            // budget Android devices), this drop can be severe. That fits "8
-            // frames over 20-30s" far better than the concurrent-use-case
-            // theory from last time, which the official docs argue against
-            // (STRATEGY_KEEP_ONLY_LATEST is specifically designed to prevent
-            // a slow analyzer from starving other use cases).
-            //
-            // setTargetFrameRate() asks CameraX to hold a frame-rate floor
-            // even under AE pressure. It's a best-effort hint, not a hard
-            // requirement — verified against the current AndroidX API surface
-            // (camera-video:1.4.0, already pinned in build.gradle; the method
-            // has existed since 1.3.0-alpha06), so it won't throw if the
-            // device genuinely can't sustain it in extreme darkness.
-            //
-            // NOTE: there is a documented CameraX quirk (AeFpsRangeLegacyQuirk)
-            // where this setting was historically ignored specifically on
-            // LEGACY-level hardware in some library versions. If the next
-            // logcat run still shows a stalled Status timeline on a LEGACY-
-            // level device, the next step is bumping camera-* to 1.5.0+,
-            // not re-guessing at the app-code layer again.
+            // setTargetFrameRate(): asks CameraX to hold a frame-rate floor
+            // even under auto-exposure pressure in dim indoor lighting,
+            // which can otherwise legitimately negotiate the sensor down to
+            // a very low FPS. Verified against the current AndroidX API
+            // surface (camera-video:1.4.0, already pinned in build.gradle;
+            // method exists since 1.3.0-alpha06). Best-effort hint, not a
+            // hard requirement — won't throw if unachievable.
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(
                     Quality.SD,
@@ -251,9 +229,9 @@ class MediaPipeHandler(private val context: Context) {
                 .build()
             videoCapture = vc
 
-            // unbindAll() here is safe & necessary the FIRST time only — there is
-            // nothing else bound yet. This is never called again after this point
-            // for the lifetime of the session, so there is no rebind cycle.
+            // Standard CameraX pattern: unbind everything, then bind the
+            // full fresh set together. This is what avoids BUG 2 (reusing a
+            // Recorder across tasks) — every task gets its own Recorder.
             cameraProvider?.unbindAll()
             cameraProvider?.bindToLifecycle(
                 lifecycleOwner,
@@ -261,7 +239,6 @@ class MediaPipeHandler(private val context: Context) {
                 imageAnalysis,
                 vc
             )
-            cameraBound = true
 
             startNewRecording()
 
@@ -269,8 +246,8 @@ class MediaPipeHandler(private val context: Context) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // startNewRecording() — starts a fresh Recording on the EXISTING,
-    // already-bound VideoCapture/Recorder. Called once per task (no rebind).
+    // startNewRecording() — starts the Recording on the VideoCapture that was
+    // JUST freshly bound in bindCamera(), for this task only.
     // pendingStartCallback only resolves on VideoRecordEvent.Start — i.e. the
     // MethodChannel "startTracking" call genuinely blocks until frames are
     // actually being encoded.
@@ -344,7 +321,6 @@ class MediaPipeHandler(private val context: Context) {
         cameraProvider?.unbindAll()
         cameraProvider = null
         videoCapture = null
-        cameraBound = false
         if (!cameraExecutor.isShutdown) cameraExecutor.shutdown()
         Log.d(TAG, "Camera released")
     }
